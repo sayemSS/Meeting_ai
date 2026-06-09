@@ -1,0 +1,25 @@
+# Core runtime
+pydantic>=2.6
+pydantic-settings>=2.2
+python-dotenv>=1.0
+
+# Browser automation
+playwright>=1.43
+
+# Async HTTP (DeepSeek client)
+httpx>=0.27
+
+# Audio capture (records the default input device; simple on Windows)
+pyaudio>=0.2.13
+
+# Transcription (default engine). For the reference engine use: openai-whisper
+faster-whisper>=1.0
+
+# Dashboard API
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# ---- Optional / future migration targets ----
+# redis>=5.0            # enable when STORAGE_BACKEND=redis
+# oracledb>=2.0         # enable when STORAGE_BACKEND=oracle
+# torch                 # only needed for GPU Whisper / openai-whisper

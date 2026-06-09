@@ -1,0 +1,11 @@
+[
+  {
+    "id": "demo001",
+    "title": "Weekly Engineering Sync",
+    "meet_url": "https://meet.google.com/abc-defg-hij",
+    "start_time": "2026-06-09T15:00:00+00:00",
+    "duration_minutes": 60,
+    "language": null,
+    "enabled": true
+  }
+]
