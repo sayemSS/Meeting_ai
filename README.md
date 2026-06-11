@@ -215,7 +215,9 @@ The `PlaywrightBot` handles all Google Meet interaction. It supports three **bro
 - A realistic desktop user-agent is injected.
 - Media stream prompts are auto-accepted (`--use-fake-ui-for-media-stream`).
 
-**Join flow**: Navigate to Meet URL → wait for DOM → mute mic → mute camera → click "Join now" or "Ask to join" (with multiple fallback selectors).
+**Join flow**: Navigate to Meet URL → wait 8 s for React render → detect login/invalid-meeting errors early → mute mic → mute camera → click "Join now" or "Ask to join" (13 fallback selectors covering text, `role="button"`, and `jsname` variants). A debug screenshot is saved to `%TEMP%` on every run for post-mortem visibility.
+
+**Click strategy** (`_safe_click`): Two-phase approach — Phase 1 uses Playwright's standard `wait_for(state="visible")` + click (fast path). Phase 2 is a retry loop that checks element *existence* (not visibility) and force-clicks, catching buttons stuck behind animations, React re-renders, or overlays that Playwright's visibility heuristic rejects.
 
 **Leave flow**: Click the hang-up button (`aria-label*="Leave call"`).
 
@@ -232,6 +234,12 @@ This opens a **real, visible Chrome window** on a dedicated profile directory (`
 ### 6. Participant Tracking (`tracker/participant_tracker.py`)
 
 Polls the Meet **People panel** every 5 seconds and diffs the current participant set against the previous snapshot. Records `JOIN` and `LEAVE` events with timestamps.
+
+**Panel detection** uses the sidebar's `role="complementary"` wrapper (checked with `.is_visible()`) rather than generic `div[role="listitem"]` selectors, which previously caused false positives — the function would think the panel was already open when it was actually closed, causing the scraper to return stale or empty data and silently miss late joiners.
+
+**DOM reading** tries all selectors (People panel list items, `aria-label`, `data-self-name`, `data-participant-id`) and **merges** their results rather than stopping at the first match. This prevents a broad selector returning partial/noisy data and blocking the more specific ones. If every selector returns empty, a **video-tile fallback** (`_read_from_video_tiles()`) is tried as a last resort.
+
+**Diagnostic logging** is built into every poll cycle: the previous snapshot, current snapshot, joined set, and left set are all logged at `INFO` level. Empty `_read_participants` results emit a `WARNING`. This makes it immediately obvious whether a late-joiner miss is a scraping problem (name never appears in `CURRENT`) or a diff-logic problem (name appears in `CURRENT` but not in `JOINED`).
 
 **Name filtering** is the hardest part — the Meet DOM is full of UI labels, icon ligatures, tooltips, and notices that look like names. The tracker uses a battle-tested denylist of:
 - Exact UI words (`"mute"`, `"camera"`, `"settings"`, etc.)
@@ -616,7 +624,7 @@ Switching backends requires **zero code changes** — only the `.env` configurat
 
 ## Known Limitations & Maintenance
 
-- **Google Meet DOM selectors** — The selectors in `automation/`, `tracker/`, and `captions/` depend on Google Meet's DOM structure and `aria-label` attributes, which change frequently and can differ by locale. Treat them as configuration that needs periodic maintenance.
+- **Google Meet DOM selectors** — The selectors in `automation/`, `tracker/`, and `captions/` depend on Google Meet's DOM structure and `aria-label` attributes, which change frequently and can differ by locale. Treat them as configuration that needs periodic maintenance. The join flow includes `jsname` fallbacks (`Qx7uuf`, `r8g1K`) which also rotate with Meet updates; if joining breaks, inspect the failure screenshot at `%TEMP%\meet_join_failed_<session_id>.png` to identify the new DOM structure.
 - **Audio capture** — PyAudio captures the default input device. To record what other participants say, you must set up a virtual audio device (VB-CABLE, PulseAudio sink, etc.) to route Meet's output into a recordable input.
 - **Google bot detection** — Google actively detects and blocks automated browsers. The `persistent` and `cdp` connect modes are the most reliable workarounds. The `launch` mode (fresh context) is frequently blocked.
 - **Whisper accuracy** — The `base` model is fast but less accurate for multi-speaker or noisy audio. Use `small` or `medium` for production. GPU acceleration (`WHISPER_DEVICE=cuda`) significantly speeds up larger models.
