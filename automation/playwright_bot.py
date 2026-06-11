@@ -24,6 +24,7 @@ should be treated as config that needs occasional maintenance.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 from pathlib import Path
@@ -94,7 +95,6 @@ class PlaywrightBot:
         """Attach to an externally launched, already-logged-in Chrome."""
         endpoint = self._settings.cdp_endpoint
         self._browser = await self._pw.chromium.connect_over_cdp(endpoint)
-        # Use the existing (logged-in) default context.
         if self._browser.contexts:
             self._context = self._browser.contexts[0]
         else:
@@ -109,7 +109,6 @@ class PlaywrightBot:
                 f"Chrome profile not found at {master}. Run "
                 f"`python -m auth.google_auth` once to create and log it in."
             )
-        # A profile dir can only be opened by one Chrome at a time, so copy it.
         self._temp_profile = Path(
             tempfile.mkdtemp(prefix=f"meet_{self.session_id}_")
         )
@@ -146,51 +145,276 @@ class PlaywrightBot:
         assert self.page is not None, "start() must be called before join()"
         page = self.page
         self.log.info("Navigating to meeting URL")
-        # Google Meet keeps polling the network forever, so "networkidle" never
-        # fires and times out. Wait for the DOM instead, then let the join UI settle.
         await page.goto(self.meet_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(8000)
 
-        # Turn off mic and camera before joining (bot should be silent).
-        await self._safe_click(
-            [
-                '[aria-label*="Turn off microphone"]',
-                'div[role="button"][aria-label*="microphone"]',
-            ],
-            timeout=4000,
-        )
-        await self._safe_click(
-            [
-                '[aria-label*="Turn off camera"]',
-                'div[role="button"][aria-label*="camera"]',
-            ],
-            timeout=4000,
-        )
+        debug_path = Path(tempfile.gettempdir()) / f"meet_debug_{self.session_id}.png"
+        try:
+            await page.screenshot(path=str(debug_path), full_page=True)
+            self.log.info("Debug screenshot saved to %s", debug_path)
+            self.log.info("Page URL: %s", page.url)
+            self.log.info("Page title: %s", await page.title())
+        except Exception as exc:
+            self.log.debug("Debug screenshot failed: %s", exc)
 
-        # Click "Join now" / "Ask to join".
+        page_text = await page.inner_text("body")
+        page_lower = page_text.lower()
+        if "sign in" in page_lower and "join" not in page_lower:
+            raise RuntimeError(
+                "Google is showing the sign-in screen — persistent profile "
+                "login may have expired. Re-run `python -m auth.google_auth`."
+            )
+        if "meeting not found" in page_lower or "no longer available" in page_lower:
+            raise RuntimeError(
+                f"Meeting URL is invalid or the meeting has ended: {self.meet_url}"
+            )
+
+        # Turn off mic and camera before joining (bot should be silent/invisible).
+        await self._ensure_mic_off()
+        await self._ensure_camera_off()
+
         joined = await self._safe_click(
             [
                 'button:has-text("Join now")',
                 'button:has-text("Ask to join")',
+                'button:has-text("Join")',
                 'span:has-text("Join now")',
                 'span:has-text("Ask to join")',
+                '[role="button"]:has-text("Join now")',
+                '[role="button"]:has-text("Ask to join")',
+                '[role="button"]:has-text("Join")',
+                'button[jsname="Qx7uuf"]',
+                'button[jsname="r8g1K"]',
+                'div[jsname="Qx7uuf"]',
+                'div[jsname="r8g1K"]',
             ],
             timeout=self._settings.join_timeout_seconds * 1000,
         )
         if not joined:
+            try:
+                fail_path = (
+                    Path(tempfile.gettempdir())
+                    / f"meet_join_failed_{self.session_id}.png"
+                )
+                await page.screenshot(path=str(fail_path), full_page=True)
+                self.log.error(
+                    "Join button not found. Failure screenshot: %s", fail_path
+                )
+            except Exception:
+                pass
             raise RuntimeError("Could not find a Join button on the Meet page")
         self.log.info("Join action submitted")
 
+    async def wait_until_admitted(self, timeout_seconds: int = 120) -> None:
+        """Wait until the host admits the bot from the lobby.
+
+        After clicking "Ask to join", Meet places the bot in a waiting lobby.
+        This method polls until the in-call UI appears (signalled by the
+        presence of the "Leave call" hang-up button), or until the timeout
+        expires, or until the meeting disappears entirely.
+
+        Once admitted, mic and camera are forcefully turned off again —
+        Meet sometimes re-enables them on entry.
+        """
+        assert self.page is not None, "start() must be called first"
+        self.log.info("Waiting to be admitted (timeout=%ds)...", timeout_seconds)
+
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        poll_interval = 3
+
+        while asyncio.get_event_loop().time() < deadline:
+            # Admitted check: "Leave call" button only appears once inside the meeting.
+            try:
+                el = await self.page.query_selector('[aria-label*="Leave call"]')
+                if el is not None:
+                    self.log.info("Admitted into the meeting.")
+                    # Meet sometimes re-enables cam/mic on admission — force off again.
+                    await self._ensure_camera_off()
+                    await self._ensure_mic_off()
+                    return
+            except Exception:
+                pass
+
+            # Meeting-ended / URL-changed check while still in lobby.
+            try:
+                page_text = (await self.page.inner_text("body")).lower()
+                if (
+                    "meeting not found" in page_text
+                    or "no longer available" in page_text
+                    or "you have been removed" in page_text
+                    or "the meeting has ended" in page_text
+                ):
+                    raise RuntimeError(
+                        "Meeting ended or bot was removed while waiting to be admitted."
+                    )
+
+                url = self.page.url or ""
+                if "meet.google.com" in url:
+                    path = url.split("meet.google.com")[-1].strip("/").split("?")[0]
+                    if not path or path.startswith("_") or path.startswith("lookup"):
+                        raise RuntimeError(
+                            "Redirected away from meeting while waiting to be admitted."
+                        )
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
+            await asyncio.sleep(poll_interval)
+
+        raise RuntimeError(
+            f"Timed out after {timeout_seconds}s waiting to be admitted. "
+            "The host may not have approved the join request."
+        )
+
+    async def _ensure_camera_off(self) -> None:
+        """Make sure camera is off. Tries button click, then keyboard shortcut.
+
+        Google Meet's camera toggle has two possible states:
+          - Camera is ON  → button says "Turn off camera"  → we click it
+          - Camera is OFF → button says "Turn on camera"   → already off, skip
+
+        Falls back to 'e' keyboard shortcut (Meet's built-in camera toggle)
+        if the button is not found.
+        """
+        assert self.page is not None
+
+        # Check if camera is currently ON (button offers to turn it off).
+        try:
+            el = await self.page.query_selector(
+                '[aria-label*="Turn off camera"], [aria-label*="turn off camera"]'
+            )
+            if el is None:
+                # Camera already off — nothing to do.
+                self.log.debug("Camera already off")
+                return
+        except Exception:
+            return
+
+        # Camera is on — click the button to turn it off.
+        clicked = await self._safe_click(
+            [
+                '[aria-label*="Turn off camera"]',
+                'button[aria-label*="camera"]',
+                'div[role="button"][aria-label*="camera"]',
+                '[data-tooltip*="camera"]',
+            ],
+            timeout=5000,
+        )
+
+        if not clicked:
+            # Fallback: 'e' is Google Meet's keyboard shortcut for camera toggle.
+            try:
+                await self.page.keyboard.press("e")
+                await self.page.wait_for_timeout(800)
+                self.log.debug("Camera toggled via keyboard shortcut 'e'")
+            except Exception as exc:
+                self.log.debug("Camera keyboard shortcut failed: %s", exc)
+            return
+
+        # Verify camera is now off.
+        await self.page.wait_for_timeout(500)
+        try:
+            still_on = await self.page.query_selector(
+                '[aria-label*="Turn off camera"]'
+            )
+            if still_on:
+                self.log.warning("Camera may still be on after click attempt")
+            else:
+                self.log.info("Camera confirmed off")
+        except Exception:
+            pass
+
+    async def _ensure_mic_off(self) -> None:
+        """Make sure microphone is off. Tries button click, then keyboard shortcut.
+
+        Same logic as _ensure_camera_off but for the microphone.
+        Keyboard fallback is 'd' (Meet's built-in mic toggle).
+        """
+        assert self.page is not None
+
+        try:
+            el = await self.page.query_selector(
+                '[aria-label*="Turn off microphone"], [aria-label*="turn off microphone"]'
+            )
+            if el is None:
+                self.log.debug("Microphone already off")
+                return
+        except Exception:
+            return
+
+        clicked = await self._safe_click(
+            [
+                '[aria-label*="Turn off microphone"]',
+                'button[aria-label*="microphone"]',
+                'div[role="button"][aria-label*="microphone"]',
+                '[data-tooltip*="microphone"]',
+            ],
+            timeout=5000,
+        )
+
+        if not clicked:
+            try:
+                await self.page.keyboard.press("d")
+                await self.page.wait_for_timeout(800)
+                self.log.debug("Mic toggled via keyboard shortcut 'd'")
+            except Exception as exc:
+                self.log.debug("Mic keyboard shortcut failed: %s", exc)
+            return
+
+        await self.page.wait_for_timeout(500)
+        try:
+            still_on = await self.page.query_selector(
+                '[aria-label*="Turn off microphone"]'
+            )
+            if still_on:
+                self.log.warning("Microphone may still be on after click attempt")
+            else:
+                self.log.info("Microphone confirmed off")
+        except Exception:
+            pass
+
     async def turn_on_captions(self) -> None:
-        """Enable live captions so the caption listener has data to read."""
+        """Enable live captions so the caption listener has data to read.
+
+        Strategy: click the captions toggle, then VERIFY it worked (the
+        button flips to "Turn off captions"). If clicking failed — Meet
+        frequently renames/moves this button — fall back to the keyboard
+        shortcut "c", which toggles captions and is far more stable.
+        """
         assert self.page is not None
         await self._safe_click(
             [
+                'button[aria-label*="Turn on captions"]',
                 '[aria-label*="Turn on captions"]',
                 'button[aria-label*="captions"]',
             ],
             timeout=8000,
         )
+        if await self._captions_enabled():
+            self.log.info("Captions enabled (button)")
+            return
+        try:
+            await self.page.keyboard.press("c")
+            await self.page.wait_for_timeout(1500)
+        except Exception as exc:
+            self.log.debug("Caption shortcut press failed: %s", exc)
+        if await self._captions_enabled():
+            self.log.info("Captions enabled (keyboard shortcut)")
+        else:
+            self.log.warning(
+                "Could not verify captions are ON — caption capture may be empty"
+            )
+
+    async def _captions_enabled(self) -> bool:
+        """True if the toggle now reads 'Turn off captions' (captions are ON)."""
+        if self.page is None:
+            return False
+        try:
+            el = await self.page.query_selector('[aria-label*="Turn off captions"]')
+            return el is not None
+        except Exception:
+            return False
 
     async def leave(self) -> None:
         """Click the hang-up button to leave the call gracefully."""
@@ -218,14 +442,12 @@ class PlaywrightBot:
         if self.page is None:
             return False
         try:
-            # 1. URL no longer points at an active meeting (e.g. xxx-yyyy-zzz).
             url = self.page.url or ""
             if "meet.google.com" in url:
                 path = url.split("meet.google.com")[-1].strip("/").split("?")[0]
                 if not path or path.startswith("_") or path.startswith("lookup"):
                     return False
 
-            # 2. Post-call UI present -> meeting ended.
             ended = await self.page.evaluate(
                 """
                 () => {
@@ -244,12 +466,9 @@ class PlaywrightBot:
             if ended:
                 return False
 
-            # 3. Hang-up control still present -> still in the call.
             el = await self.page.query_selector('[aria-label*="Leave call"]')
             return el is not None
         except Exception:
-            # On any DOM/navigation error, assume the call is over so the
-            # session can finish and save its transcript rather than hang.
             return False
 
     async def stop(self) -> None:
@@ -257,7 +476,6 @@ class PlaywrightBot:
         try:
             if self._context is not None:
                 await self._context.close()
-            # In CDP mode the browser is owned externally; don't kill it.
             if self._browser is not None and self._settings.browser_connect_mode != "cdp":
                 await self._browser.close()
             if self._pw is not None:
@@ -269,15 +487,52 @@ class PlaywrightBot:
             self.log.info("Browser context stopped")
 
     async def _safe_click(self, selectors: list[str], timeout: int) -> bool:
-        """Try a list of selectors; click the first that appears. Never raises."""
+        """Try a list of selectors; click the first that appears.
+
+        Two-phase approach to handle Google Meet's delayed React renders:
+          Phase 1 — normal Playwright wait-for-visible + click (fast path).
+          Phase 2 — retry loop that checks element *existence* (not visibility)
+                    and force-clicks. Catches buttons that are in the DOM but
+                    still animating, temporarily detached, or behind an overlay
+                    that Playwright's visibility heuristic rejects.
+
+        Never raises.
+        """
         assert self.page is not None
-        per_selector = max(500, timeout // max(1, len(selectors)))
+
+        per_selector = max(800, timeout // max(1, len(selectors)))
         for selector in selectors:
             try:
                 locator = self.page.locator(selector).first
                 await locator.wait_for(state="visible", timeout=per_selector)
                 await locator.click()
+                self.log.debug("Clicked (phase 1): %s", selector)
                 return True
             except Exception:
                 continue
+
+        self.log.debug(
+            "Phase 1 missed all selectors; retrying with force-click (%d ms budget)",
+            timeout,
+        )
+        deadline = asyncio.get_event_loop().time() + (timeout / 1000)
+        retry_interval = 1.0
+
+        while asyncio.get_event_loop().time() < deadline:
+            for selector in selectors:
+                try:
+                    locator = self.page.locator(selector)
+                    count = await locator.count()
+                    if count == 0:
+                        continue
+                    await locator.first.click(timeout=2000, force=True)
+                    self.log.debug("Clicked (phase 2, force): %s", selector)
+                    return True
+                except Exception:
+                    continue
+            try:
+                await asyncio.sleep(retry_interval)
+            except asyncio.CancelledError:
+                break
+
         return False

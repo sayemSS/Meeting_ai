@@ -104,6 +104,12 @@ class Session:
         self._bot = PlaywrightBot(self.session_id, self.meeting.meet_url)
         page = await self._bot.start()
         await self._bot.join()
+        # "Ask to join" only puts us in the lobby — wait until the host
+        # actually admits the bot so actual_start and the meeting timer
+        # reflect real in-meeting time, not lobby waiting time.
+        await self._bot.wait_until_admitted(
+            timeout_seconds=self._settings.join_timeout_seconds * 2
+        )
         await self._bot.turn_on_captions()
 
         self._metadata.mark_started()
@@ -194,8 +200,29 @@ class Session:
 
     async def _summarize(self, transcript: Transcript) -> MeetingSummary:
         self._set_state(SessionState.SUMMARIZING)
-        summary = await SummaryService(self.session_id).summarize(transcript)
+        summary = await SummaryService(
+            self.session_id, language=self.meeting.language
+        ).summarize(transcript)
         await self.storage.save_summary(self.session_id, summary)
+        # Render the human-readable management report next to summary.json.
+        try:
+            from summary.report_builder import build_report
+
+            metadata = self._metadata.build(self._tracker, self.state, self.error)
+            report_md = build_report(metadata, summary)
+            (self._dir / "report.md").write_text(report_md, encoding="utf-8")
+            self.log.info("Management report written to %s", self._dir / "report.md")
+        except Exception as exc:
+            self.log.error("Failed to write report.md: %s", exc)
+        # Render the management PDF so the dashboard can serve it instantly.
+        # Failure here must never fail the session.
+        try:
+            from report.report_service import ReportService
+
+            metadata = self._metadata.build(self._tracker, self.state, self.error)
+            await ReportService().build(metadata, summary, self._dir / "report.pdf")
+        except Exception as exc:
+            self.log.warning("PDF report generation failed: %s", exc)
         return summary
 
     # ------------------------------------------------------------------ #

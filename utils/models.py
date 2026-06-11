@@ -119,5 +119,7 @@ class MeetingSummary(BaseModel):
     key_points: list[str] = Field(default_factory=list)
     decisions: list[str] = Field(default_factory=list)
     action_items: list[ActionItem] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)        # ← ADDED
+    next_steps: list[str] = Field(default_factory=list)   # ← ADDED
     sentiment: Optional[str] = None
     generated_at: datetime = Field(default_factory=utcnow)

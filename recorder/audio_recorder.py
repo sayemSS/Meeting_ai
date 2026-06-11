@@ -78,6 +78,28 @@ class AudioRecorder:
         device_index = self._device_index()
 
         audio = pyaudio.PyAudio()
+        # Log the device we are about to record, and warn if it looks like a
+        # physical microphone: meeting audio comes out of the SPEAKERS, so a
+        # mic records near-silence and Whisper then hallucinates text. The
+        # fix is a virtual cable (VB-CABLE) + AUDIO_INPUT_DEVICE_INDEX.
+        try:
+            info = (
+                audio.get_device_info_by_index(device_index)
+                if device_index is not None
+                else audio.get_default_input_device_info()
+            )
+            name = str(info.get("name", "?"))
+            self.log.info("Recording from device #%s: %s", info.get("index"), name)
+            virtual_markers = ("cable", "vb-audio", "virtual", "stereo mix", "loopback", "blackhole")
+            if not any(m in name.lower() for m in virtual_markers):
+                self.log.warning(
+                    "Input device '%s' looks like a physical microphone — "
+                    "participants' voices will NOT be captured. Install "
+                    "VB-CABLE and set AUDIO_INPUT_DEVICE_INDEX in .env.",
+                    name,
+                )
+        except Exception as exc:
+            self.log.debug("Could not inspect audio device: %s", exc)
         stream = None
         frames: list[bytes] = []
         try:

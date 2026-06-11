@@ -75,7 +75,11 @@ class WhisperService:
         if not audio_path.exists():
             self.log.warning("Audio file missing; returning empty transcript")
             return Transcript()
-        lang = language or (self._settings.whisper_language or None)
+        lang = (language or self._settings.whisper_language or "").strip().lower()
+        # "auto" / "mixed" / "others" are app-level choices, not Whisper
+        # language codes: all of them mean "let Whisper auto-detect".
+        if lang in ("", "auto", "mixed", "others", "other"):
+            lang = None
         return await run_blocking(self._transcribe_sync, audio_path, lang)
 
     def _transcribe_sync(self, audio_path: Path, language: Optional[str]) -> Transcript:
@@ -85,13 +89,40 @@ class WhisperService:
         return self._transcribe_openai(model, audio_path, language)
 
     def _transcribe_faster(self, model, audio_path: Path, language: Optional[str]) -> Transcript:
-        segments_iter, info = model.transcribe(
-            str(audio_path), language=language, vad_filter=True
-        )
-        segments = [
-            TranscriptSegment(start=float(s.start), end=float(s.end), text=s.text.strip())
-            for s in segments_iter
-        ]
+        """faster-whisper with a softened VAD, and a no-VAD retry.
+
+        The default Silero VAD settings are tuned for clean close-mic
+        English and can discard perfectly intelligible far-field/Bangla
+        speech wholesale (observed: 3 of 5 minutes of clear speech thrown
+        away). So: (1) run with a much more permissive VAD; (2) if the
+        result still looks empty/degenerate, retry once with VAD fully
+        OFF and keep whichever result has more real content.
+        """
+        def run(vad: bool):
+            kwargs = {"language": language, "vad_filter": vad}
+            if vad:
+                kwargs["vad_parameters"] = {
+                    "threshold": 0.2,              # default 0.5 — far less aggressive
+                    "min_silence_duration_ms": 1500,
+                    "speech_pad_ms": 600,
+                }
+            segments_iter, info = model.transcribe(str(audio_path), **kwargs)
+            segs = [
+                TranscriptSegment(start=float(s.start), end=float(s.end), text=s.text.strip())
+                for s in segments_iter
+            ]
+            return segs, info
+
+        segments, info = run(vad=True)
+        if self._is_degenerate(segments):
+            self.log.warning(
+                "Transcript looks empty/degenerate with VAD on (%d segments); "
+                "retrying with VAD off", len(segments)
+            )
+            segments2, info2 = run(vad=False)
+            if self._content_score(segments2) > self._content_score(segments):
+                segments, info = segments2, info2
+
         transcript = Transcript(
             language=getattr(info, "language", language),
             duration=float(getattr(info, "duration", 0.0)),
@@ -99,6 +130,22 @@ class WhisperService:
         )
         self.log.info("Transcription complete (%d segments)", len(segments))
         return transcript
+
+    @staticmethod
+    def _content_score(segments: list[TranscriptSegment]) -> int:
+        """How much *distinct* text a result contains (for picking a winner)."""
+        words = " ".join(s.text for s in segments).lower().split()
+        return len(set(words))
+
+    @classmethod
+    def _is_degenerate(cls, segments: list[TranscriptSegment]) -> bool:
+        """True when output is empty or a hallucination loop ('ola' x7)."""
+        if not segments:
+            return True
+        words = " ".join(s.text for s in segments).lower().split()
+        if len(words) < 5:
+            return True
+        return len(set(words)) / len(words) < 0.2
 
     def _transcribe_openai(self, model, audio_path: Path, language: Optional[str]) -> Transcript:
         result = model.transcribe(str(audio_path), language=language)
