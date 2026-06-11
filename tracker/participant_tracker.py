@@ -149,16 +149,16 @@ class ParticipantTracker:
         captions still reveal real speaker names. Any name not already seen is
         recorded as a JOIN so it shows up in the participant list and timeline.
         """
-        existing = set(self.unique_participants)
+        existing = {p.lower() for p in self.unique_participants}
         for raw in names:
             if not raw or raw == "Unknown":
                 continue
             cleaned = clean_name(raw)
-            if cleaned and cleaned not in existing:
+            if cleaned and cleaned.lower() not in existing:
                 self.events.append(
                     ParticipantEvent(name=cleaned, action=ParticipantAction.JOIN)
                 )
-                existing.add(cleaned)
+                existing.add(cleaned.lower())
         self._peak = max(self._peak, len(existing))
 
     def start(self) -> None:
@@ -203,9 +203,14 @@ class ParticipantTracker:
 
     async def _open_people_panel(self) -> None:
         """Ensure the People panel is open (idempotent, safe to call each poll)."""
-        # If the participant list is already on screen, do nothing.
+        # Only skip if the *Participants* panel specifically is on screen —
+        # any other list (chat, settings) must not satisfy this check.
         try:
-            if await self.page.query_selector('div[role="list"] div[role="listitem"]'):
+            panel = await self.page.query_selector(
+                '[aria-label*="Participants"] div[role="listitem"], '
+                '[aria-label*="People"] div[role="listitem"]'
+            )
+            if panel:
                 return
         except Exception:
             pass
@@ -230,15 +235,22 @@ class ParticipantTracker:
 
         The People panel's list is the authoritative source because it
         includes everyone present, even people who never speak or turn on
-        their camera. Video-tile selectors are only a secondary fallback.
+        their camera. Names are collected from EVERY selector and unioned,
+        because each selector alone can miss people (e.g. the list shows one
+        person while the "Profile photo of <Full Name>" labels reveal more).
+        The aria-label selectors are tried first since they carry the full
+        first+last name, while tile text is sometimes truncated.
         """
         names: set[str] = set()
+        seen_lower: set[str] = set()
         selectors = [
+            # Full-name sources first ("Profile photo of Sayem Biswas").
+            '[aria-label^="Profile photo of"]',
+            '[aria-label^="Profile picture of"]',
             # People panel list items (authoritative — includes silent people).
             'div[role="list"] div[role="listitem"]',
             'div[role="listitem"]',
             # Per-participant data attributes / labels.
-            '[aria-label^="Profile photo of"]',
             '[data-participant-id] [data-self-name]',
             '[data-self-name]',
             '[data-participant-id]',
@@ -253,10 +265,9 @@ class ParticipantTracker:
                         or await h.inner_text()
                     )
                     cleaned = clean_name(raw or "")
-                    if cleaned:
+                    if cleaned and cleaned.lower() not in seen_lower:
                         names.add(cleaned)
-                if names:
-                    break
+                        seen_lower.add(cleaned.lower())
             except Exception:
                 continue
         return names

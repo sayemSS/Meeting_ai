@@ -124,6 +124,12 @@ class Session:
         self._set_state(SessionState.LEAVING)
         await self._recorder.stop()
         await self._captions.stop()
+        # Merge caption speaker names into the participant roster. The DOM
+        # tracker can miss people (People panel closed, selector drift), but
+        # anyone who spoke appears in the captions with their real name.
+        self._tracker.add_known_names(
+            [c.speaker for c in self._captions.captions]
+        )
         await self._tracker.stop()
         await self._bot.leave()
         await self._bot.stop()
@@ -149,6 +155,15 @@ class Session:
             if not await self._bot.is_still_in_call():
                 self.log.info("Ending capture: no longer in call (host ended / removed)")
                 return
+            # Keep the live roster complete: fold caption speaker names into
+            # the tracker as the meeting runs (not only at the end).
+            if self._tracker and self._captions:
+                try:
+                    self._tracker.add_known_names(
+                        [c.speaker for c in self._captions.captions]
+                    )
+                except Exception:
+                    pass
             try:
                 await asyncio.wait_for(self._stop_requested.wait(), timeout=check_interval)
             except asyncio.TimeoutError:
