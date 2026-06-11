@@ -24,6 +24,7 @@ should be treated as config that needs occasional maintenance.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 from pathlib import Path
@@ -142,14 +143,48 @@ class PlaywrightBot:
         )
 
     async def join(self) -> None:
-        """Navigate to the meeting and click through the join flow."""
+        """Navigate to the meeting and click through the join flow.
+
+        Google Meet is a heavy React SPA: the join button can take several
+        seconds to render, may be hidden behind an animation, or may be an
+        "Ask to join" variant depending on the meeting's access policy.
+        This method is deliberately generous with waits and uses a broad
+        selector set to cover all known variants.
+        """
         assert self.page is not None, "start() must be called before join()"
         page = self.page
         self.log.info("Navigating to meeting URL")
         # Google Meet keeps polling the network forever, so "networkidle" never
         # fires and times out. Wait for the DOM instead, then let the join UI settle.
         await page.goto(self.meet_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
+
+        # Meet's React app takes 4-8 s to render the join preview screen
+        # (camera/mic toggles + Join button). Be generous.
+        await page.wait_for_timeout(8000)
+
+        # Take a debug screenshot so we can see exactly what Meet is showing
+        # when the join attempt fails (login screen? meeting not found? etc.).
+        debug_path = Path(tempfile.gettempdir()) / f"meet_debug_{self.session_id}.png"
+        try:
+            await page.screenshot(path=str(debug_path), full_page=True)
+            self.log.info("Debug screenshot saved to %s", debug_path)
+            self.log.info("Page URL: %s", page.url)
+            self.log.info("Page title: %s", await page.title())
+        except Exception as exc:
+            self.log.debug("Debug screenshot failed: %s", exc)
+
+        # Detect obviously wrong states before wasting time on selectors.
+        page_text = await page.inner_text("body")
+        page_lower = page_text.lower()
+        if "sign in" in page_lower and "join" not in page_lower:
+            raise RuntimeError(
+                "Google is showing the sign-in screen — persistent profile "
+                "login may have expired. Re-run `python -m auth.google_auth`."
+            )
+        if "meeting not found" in page_lower or "no longer available" in page_lower:
+            raise RuntimeError(
+                f"Meeting URL is invalid or the meeting has ended: {self.meet_url}"
+            )
 
         # Turn off mic and camera before joining (bot should be silent).
         await self._safe_click(
@@ -157,27 +192,52 @@ class PlaywrightBot:
                 '[aria-label*="Turn off microphone"]',
                 'div[role="button"][aria-label*="microphone"]',
             ],
-            timeout=4000,
+            timeout=5000,
         )
         await self._safe_click(
             [
                 '[aria-label*="Turn off camera"]',
                 'div[role="button"][aria-label*="camera"]',
             ],
-            timeout=4000,
+            timeout=5000,
         )
 
         # Click "Join now" / "Ask to join".
+        # Google Meet rotates jsname values and uses locale-specific labels,
+        # so we combine text, role, and jsname selectors for coverage.
         joined = await self._safe_click(
             [
                 'button:has-text("Join now")',
                 'button:has-text("Ask to join")',
+                'button:has-text("Join")',
                 'span:has-text("Join now")',
                 'span:has-text("Ask to join")',
+                '[role="button"]:has-text("Join now")',
+                '[role="button"]:has-text("Ask to join")',
+                '[role="button"]:has-text("Join")',
+                # Known jsname values for the join button (may change with
+                # Meet updates, but provide a fallback when text selectors
+                # fail due to locale or DOM restructuring).
+                'button[jsname="Qx7uuf"]',
+                'button[jsname="r8g1K"]',
+                'div[jsname="Qx7uuf"]',
+                'div[jsname="r8g1K"]',
             ],
             timeout=self._settings.join_timeout_seconds * 1000,
         )
         if not joined:
+            # Take another screenshot right at failure for maximum clarity.
+            try:
+                fail_path = (
+                    Path(tempfile.gettempdir())
+                    / f"meet_join_failed_{self.session_id}.png"
+                )
+                await page.screenshot(path=str(fail_path), full_page=True)
+                self.log.error(
+                    "Join button not found. Failure screenshot: %s", fail_path
+                )
+            except Exception:
+                pass
             raise RuntimeError("Could not find a Join button on the Meet page")
         self.log.info("Join action submitted")
 
@@ -269,15 +329,57 @@ class PlaywrightBot:
             self.log.info("Browser context stopped")
 
     async def _safe_click(self, selectors: list[str], timeout: int) -> bool:
-        """Try a list of selectors; click the first that appears. Never raises."""
+        """Try a list of selectors; click the first that appears.
+
+        Two-phase approach to handle Google Meet's delayed React renders:
+          Phase 1 — normal Playwright wait-for-visible + click (fast path).
+          Phase 2 — retry loop that checks element *existence* (not visibility)
+                    and force-clicks. Catches buttons that are in the DOM but
+                    still animating, temporarily detached, or behind an overlay
+                    that Playwright's visibility heuristic rejects.
+
+        Never raises.
+        """
         assert self.page is not None
-        per_selector = max(500, timeout // max(1, len(selectors)))
+
+        # ---- Phase 1: standard visible-click --------------------------------
+        per_selector = max(800, timeout // max(1, len(selectors)))
         for selector in selectors:
             try:
                 locator = self.page.locator(selector).first
                 await locator.wait_for(state="visible", timeout=per_selector)
                 await locator.click()
+                self.log.debug("Clicked (phase 1): %s", selector)
                 return True
             except Exception:
                 continue
+
+        # ---- Phase 2: existence + force-click retry ---------------------------
+        # Give Meet's React tree one more pass; elements often exist in the DOM
+        # before Playwright considers them "visible".
+        self.log.debug(
+            "Phase 1 missed all selectors; retrying with force-click (%d ms budget)",
+            timeout,
+        )
+        deadline = asyncio.get_event_loop().time() + (timeout / 1000)
+        retry_interval = 1.0  # seconds between retries
+
+        while asyncio.get_event_loop().time() < deadline:
+            for selector in selectors:
+                try:
+                    locator = self.page.locator(selector)
+                    count = await locator.count()
+                    if count == 0:
+                        continue
+                    # Click with force=True to bypass the visibility check.
+                    await locator.first.click(timeout=2000, force=True)
+                    self.log.debug("Clicked (phase 2, force): %s", selector)
+                    return True
+                except Exception:
+                    continue
+            try:
+                await asyncio.sleep(retry_interval)
+            except asyncio.CancelledError:
+                break
+
         return False

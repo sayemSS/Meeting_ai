@@ -175,14 +175,28 @@ class ParticipantTracker:
         self.log.info("Participant tracker started")
         # Try to open the People panel once so list items are available.
         await self._open_people_panel()
+        poll_count = 0
         while not self._stop.is_set():
             try:
                 # Re-open the People panel if it has closed; people who never
                 # speak only ever appear in this list, so it must stay open.
                 await self._open_people_panel()
                 present = await self._read_participants()
+                poll_count += 1
+                self.log.info(
+                    "Poll #%d: PREVIOUS=%s CURRENT=%s",
+                    poll_count,
+                    sorted(self._current),
+                    sorted(present),
+                )
                 if present:
                     self._diff_and_record(present)
+                else:
+                    self.log.warning(
+                        "Poll #%d: _read_participants returned empty set "
+                        "(panel may be closed or DOM changed)",
+                        poll_count,
+                    )
             except Exception as exc:
                 self.log.debug("Participant poll failed: %s", exc)
             try:
@@ -194,6 +208,8 @@ class ParticipantTracker:
     def _diff_and_record(self, present: set[str]) -> None:
         joined = present - self._current
         left = self._current - present
+        if joined or left:
+            self.log.info("JOINED=%s  LEFT=%s", sorted(joined), sorted(left))
         for name in sorted(joined):
             self.events.append(ParticipantEvent(name=name, action=ParticipantAction.JOIN))
         for name in sorted(left):
@@ -201,29 +217,57 @@ class ParticipantTracker:
         self._current = present
         self._peak = max(self._peak, len(present))
 
+    # Selectors that uniquely identify the People panel's participant list.
+    # These are checked in order of specificity; the first match wins.
+    _PEOPLE_PANEL_INDICATORS = [
+        # The People panel wrapper — present only when the sidebar is open.
+        'div[role="complementary"]',
+        # The participant list inside a complementary/sidebar region.
+        'div[role="complementary"] div[role="list"]',
+        # Google Meet's specific data attribute on the people list container.
+        '[data-meeting-participants-list]',
+    ]
+
     async def _open_people_panel(self) -> None:
-        """Ensure the People panel is open (idempotent, safe to call each poll)."""
-        # If the participant list is already on screen, do nothing.
-        try:
-            if await self.page.query_selector('div[role="list"] div[role="listitem"]'):
-                return
-        except Exception:
-            pass
+        """Ensure the People panel is open (idempotent, safe to call each poll).
+
+        Uses panel-level visibility checks rather than generic listitem selectors
+        to avoid false positives from unrelated Meet UI elements.
+        """
+        # Check whether the People panel sidebar is actually visible.
+        for indicator in self._PEOPLE_PANEL_INDICATORS:
+            try:
+                el = await self.page.query_selector(indicator)
+                if el and await el.is_visible():
+                    # Panel is open and visible — give DOM a moment to settle
+                    # after any late-joiner render, then return.
+                    await self.page.wait_for_timeout(300)
+                    return
+            except Exception:
+                continue
+
+        # Panel is not open — try to click the button that opens it.
         selectors = [
             'button[aria-label*="Show everyone"]',
             'button[aria-label*="People"]',
             'button[aria-label*="participant"]',
             'button[aria-label*="Participants"]',
+            # Meet sometimes uses a plain icon button with a people tooltip.
+            'button[data-tooltip*="People"]',
+            'button[data-tooltip*="everyone"]',
         ]
         for selector in selectors:
             try:
                 btn = self.page.locator(selector).first
                 await btn.wait_for(state="visible", timeout=2000)
                 await btn.click()
-                await self.page.wait_for_timeout(800)
+                # Wait for the panel to render its participant list.
+                await self.page.wait_for_timeout(1200)
+                self.log.info("Clicked People panel button (%s)", selector)
                 return
             except Exception:
                 continue
+        self.log.warning("Could not find People panel button to click")
 
     async def _read_participants(self) -> set[str]:
         """Read and clean the current set of participant names from the DOM.
@@ -231,12 +275,16 @@ class ParticipantTracker:
         The People panel's list is the authoritative source because it
         includes everyone present, even people who never speak or turn on
         their camera. Video-tile selectors are only a secondary fallback.
+
+        All selectors are tried and their results merged (no early break) so
+        that a single stale/noisy selector never blocks a more specific one.
         """
         names: set[str] = set()
+        # Ordered from most-specific to least-specific.
         selectors = [
             # People panel list items (authoritative — includes silent people).
+            'div[role="complementary"] div[role="listitem"]',
             'div[role="list"] div[role="listitem"]',
-            'div[role="listitem"]',
             # Per-participant data attributes / labels.
             '[aria-label^="Profile photo of"]',
             '[data-participant-id] [data-self-name]',
@@ -255,8 +303,44 @@ class ParticipantTracker:
                     cleaned = clean_name(raw or "")
                     if cleaned:
                         names.add(cleaned)
-                if names:
-                    break
+                # Log what this specific selector found for debugging.
+                if handles:
+                    self.log.debug(
+                        "Selector '%s' matched %d elements",
+                        selector,
+                        len(handles),
+                    )
+            except Exception as exc:
+                self.log.debug("Selector '%s' failed: %s", selector, exc)
+                continue
+
+        # Fallback: if People-panel selectors found nothing, try video tiles.
+        if not names:
+            names = await self._read_from_video_tiles()
+
+        return names
+
+    async def _read_from_video_tiles(self) -> set[str]:
+        """Last-resort: scrape names from visible video-tile overlays."""
+        names: set[str] = set()
+        tile_selectors = [
+            '[data-self-name]',
+            '.zs7s8v',  # Google Meet video tile name overlay (class may change).
+            'div[role="listitem"]',
+        ]
+        for selector in tile_selectors:
+            try:
+                handles = await self.page.query_selector_all(selector)
+                for h in handles:
+                    raw = (
+                        await h.get_attribute("data-self-name")
+                        or await h.inner_text()
+                    )
+                    cleaned = clean_name(raw or "")
+                    if cleaned:
+                        names.add(cleaned)
             except Exception:
                 continue
+        if names:
+            self.log.debug("Video-tile fallback found: %s", sorted(names))
         return names

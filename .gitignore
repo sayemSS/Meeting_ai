@@ -7,3 +7,21 @@ auth/storage_state.json
 meetings/meeting_*/
 *.wav
 env
+.env
+
+# Chrome profile
+auth/chrome_profile/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Debug screenshots
+*.png
+
+# Audio outputs
+*.wav
+
+# Temporary files
+*.tmp
