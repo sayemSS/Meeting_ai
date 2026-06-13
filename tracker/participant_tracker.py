@@ -186,7 +186,7 @@ class ParticipantTracker:
                 await self._open_people_panel()
                 present = await self._read_participants()
                 poll_count += 1
-                self.log.info(
+                self.log.debug(
                     "Poll #%d: PREVIOUS=%s CURRENT=%s",
                     poll_count,
                     sorted(self._current),
@@ -195,9 +195,12 @@ class ParticipantTracker:
                 if present:
                     self._diff_and_record(present)
                 else:
-                    self.log.warning(
-                        "Poll #%d: _read_participants returned empty set "
-                        "(panel may be closed or DOM changed)",
+                    # Expected when the People panel can't be opened (Meet UI
+                    # changes). Not an error: caption speaker names are merged
+                    # in by the session and are the primary roster source.
+                    self.log.debug(
+                        "Poll #%d: People panel empty/unreadable; "
+                        "relying on caption speaker names",
                         poll_count,
                     )
             except Exception as exc:
@@ -274,7 +277,10 @@ class ParticipantTracker:
                 return
             except Exception:
                 continue
-        self.log.warning("Could not find People panel button to click")
+        self.log.debug(
+            "People panel button not found; caption speaker names will be "
+            "used as the participant roster instead"
+        )
 
     async def _read_participants(self) -> set[str]:
         """Read and clean the current set of participant names from the DOM.

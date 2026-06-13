@@ -26,14 +26,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from config import get_settings
 from manager.meeting_manager import MeetingManager
 from scheduler.meeting_scheduler import MeetingScheduler
-from utils.helpers import new_session_id
-from utils.models import MeetingMetadata, ScheduledMeeting
+from utils.helpers import new_session_id, read_json, run_blocking, write_json
+from utils.language import resolve_report_language
+from utils.models import (
+    MeetingMetadata,
+    MeetingSummary,
+    ScheduledMeeting,
+    Transcript,
+    TranscriptSegment,
+)
 
 
 from typing import Literal
@@ -82,6 +90,19 @@ def _meeting_row(meta: MeetingMetadata) -> dict:
 def create_app(manager: MeetingManager, scheduler: MeetingScheduler) -> FastAPI:
     app = FastAPI(title="Meeting AI Assistant", version="2.0.0")
     settings = get_settings()
+
+    # Allow the separate dashboard frontend (e.g. http://localhost:3000) to
+    # call this API from the browser. Without this, the browser's preflight
+    # OPTIONS request is rejected with 405 and every fetch fails with
+    # "Failed to fetch". allow_origins="*" is fine for a local/single-user
+    # setup; tighten it to the real dashboard origin in production.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -203,14 +224,41 @@ def create_app(manager: MeetingManager, scheduler: MeetingScheduler) -> FastAPI:
     # ------------------------------------------------------------------ #
     @app.get("/meetings/{session_id}")
     async def get_meeting(session_id: str) -> dict:
-        """Everything about one meeting in a single call (for a detail page)."""
+        """Everything about one meeting in a single call (for a detail page).
+
+        metadata.json is only written once the meeting ends, so while a meeting
+        is still running we synthesise a metadata view from the live session.
+        This lets the detail page (and its live-captions tab) open mid-meeting.
+        """
         meta = await manager.storage.load_metadata(session_id)
         if meta is None:
+            live = manager.get_session(session_id)
+            if live is not None:
+                snap = live.snapshot()
+                return {
+                    "metadata": {
+                        "session_id": session_id,
+                        "title": snap["title"],
+                        "meet_url": live.meeting.meet_url,
+                        "language": None,
+                        "scheduled_start": None,
+                        "actual_start": None,
+                        "actual_end": None,
+                        "duration_seconds": 0.0,
+                        "unique_participants": snap["participants"],
+                        "peak_participant_count": snap["peak_participants"],
+                        "state": snap["state"],
+                        "error": snap["error"],
+                    },
+                    "summary": None,
+                    "live": True,
+                }
             raise HTTPException(status_code=404, detail="Meeting not found")
         summary = await manager.storage.load_summary(session_id)
         return {
             "metadata": meta.model_dump(),
             "summary": summary.model_dump() if summary else None,
+            "live": False,
         }
 
     @app.get("/meetings/{session_id}/metadata")
@@ -227,12 +275,81 @@ def create_app(manager: MeetingManager, scheduler: MeetingScheduler) -> FastAPI:
             raise HTTPException(status_code=404, detail="Transcript not found")
         return data.model_dump()
 
+    @app.get("/meetings/{session_id}/captions")
+    async def get_captions(session_id: str) -> dict:
+        """Live captions while the meeting is running (read from the active
+        session in memory), or the saved captions.json once it has ended.
+
+        `live` is True while the meeting is still in progress, so the UI knows
+        to keep polling; the Whisper transcript replaces these afterwards.
+        """
+        live = manager.get_session(session_id)
+        if live is not None:
+            caps = live.caption_entries()
+            return {"captions": [c.model_dump() for c in caps], "live": True}
+        saved = await manager.storage.load_captions(session_id)
+        return {"captions": [c.model_dump() for c in saved], "live": False}
+
     @app.get("/meetings/{session_id}/summary")
     async def get_summary(session_id: str) -> dict:
         data = await manager.storage.load_summary(session_id)
         if data is None:
             raise HTTPException(status_code=404, detail="Summary not found")
         return data.model_dump()
+
+    @app.post("/meetings/{session_id}/quick-summary")
+    async def make_quick_summary(session_id: str) -> dict:
+        """Generate an on-demand summary from the captions captured so far.
+
+        This is the fast "urgent" preview: it uses the live (or saved) Meet
+        captions instead of waiting for the full Whisper transcript. The result
+        is saved separately as quick_summary.json so it never overwrites the
+        final transcript-based summary.json.
+        """
+        live = manager.get_session(session_id)
+        if live is not None:
+            caps = live.caption_entries()
+            requested_lang = live.meeting.language
+        else:
+            caps = await manager.storage.load_captions(session_id)
+            requested_lang = None
+        caps = [c for c in caps if c.text and c.text.strip()]
+        if not caps:
+            raise HTTPException(
+                status_code=404,
+                detail="No captions captured yet (are Meet captions ON?)",
+            )
+
+        transcript = Transcript(
+            segments=[
+                TranscriptSegment(start=0.0, end=0.0, text=c.text, speaker=c.speaker)
+                for c in caps
+            ]
+        )
+        report_language = resolve_report_language(requested_lang, transcript.language)
+        from summary.summary_service import SummaryService
+
+        summary = await SummaryService(
+            session_id, language=report_language
+        ).summarize(transcript)
+        await run_blocking(
+            write_json,
+            settings.session_dir(session_id) / "quick_summary.json",
+            summary,
+        )
+        return {
+            "summary": summary.model_dump(),
+            "source": "captions",
+            "caption_lines": len(caps),
+        }
+
+    @app.get("/meetings/{session_id}/quick-summary")
+    async def get_quick_summary(session_id: str) -> dict:
+        """Return the previously generated caption-based quick summary, if any."""
+        path = settings.session_dir(session_id) / "quick_summary.json"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="No quick summary yet")
+        return MeetingSummary(**read_json(path)).model_dump()
 
     @app.get("/meetings/{session_id}/report.pdf")
     async def get_report_pdf(session_id: str) -> FileResponse:

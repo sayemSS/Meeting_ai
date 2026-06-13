@@ -53,3 +53,6 @@ class Oracle26aiStorageBackend(StorageBackend):
 
     async def load_summary(self, session_id: str) -> Optional[MeetingSummary]:
         raise NotImplementedError(_NOT_IMPLEMENTED)
+
+    async def load_captions(self, session_id: str) -> list[CaptionEntry]:
+        raise NotImplementedError(_NOT_IMPLEMENTED)

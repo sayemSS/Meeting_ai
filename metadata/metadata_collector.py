@@ -26,6 +26,8 @@ class MetadataCollector:
         self.scheduled_start: Optional[datetime] = None
         self.actual_start: Optional[datetime] = None
         self.actual_end: Optional[datetime] = None
+        # Set by the session once Whisper has detected the meeting language.
+        self.detected_language: Optional[str] = None
 
     def mark_started(self) -> None:
         self.actual_start = utcnow()
@@ -47,6 +49,7 @@ class MetadataCollector:
             session_id=self.session_id,
             title=self.title,
             meet_url=self.meet_url,
+            language=self.detected_language,
             scheduled_start=self.scheduled_start,
             actual_start=self.actual_start,
             actual_end=self.actual_end,

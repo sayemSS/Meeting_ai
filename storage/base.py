@@ -55,6 +55,9 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     async def load_summary(self, session_id: str) -> Optional[MeetingSummary]: ...
 
+    @abc.abstractmethod
+    async def load_captions(self, session_id: str) -> list[CaptionEntry]: ...
+
 
 def build_storage_backend(backend: str) -> StorageBackend:
     """Factory that returns the configured storage backend implementation."""

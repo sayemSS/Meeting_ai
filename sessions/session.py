@@ -26,6 +26,7 @@ from storage.base import StorageBackend
 from summary.summary_service import SummaryService
 from tracker.participant_tracker import ParticipantTracker
 from transcriber.whisper_service import WhisperService
+from utils.language import resolve_report_language
 from utils.logger import session_logger
 from utils.models import MeetingSummary, ScheduledMeeting, SessionState, Transcript
 
@@ -95,6 +96,10 @@ class Session:
             "captions": len(self._captions.captions) if self._captions else 0,
             "error": self.error,
         }
+
+    def caption_entries(self) -> list:
+        """Captions captured so far (live, in-memory), for the dashboard."""
+        return list(self._captions.captions) if self._captions else []
 
     # ------------------------------------------------------------------ #
     # Pipeline stages
@@ -195,13 +200,31 @@ class Session:
                 ]
             )
 
+        # Record the language Whisper detected. This flows into metadata.json
+        # and, via _summarize(), drives the language of the summary and report.
+        self._metadata.detected_language = transcript.language
+        self.log.info(
+            "Detected meeting language: %s", transcript.language or "unknown"
+        )
+
         await self.storage.save_transcript(self.session_id, transcript)
         return transcript
 
     async def _summarize(self, transcript: Transcript) -> MeetingSummary:
         self._set_state(SessionState.SUMMARIZING)
+        # The report must follow the meeting's language. An explicit user
+        # choice (e.g. forced English/Bangla) wins; otherwise we use the
+        # language Whisper detected from the audio. This is what makes an
+        # English meeting produce an English report.
+        report_language = resolve_report_language(
+            self.meeting.language, transcript.language
+        )
+        self.log.info(
+            "Report language resolved to '%s' (requested=%s, detected=%s)",
+            report_language, self.meeting.language, transcript.language,
+        )
         summary = await SummaryService(
-            self.session_id, language=self.meeting.language
+            self.session_id, language=report_language
         ).summarize(transcript)
         await self.storage.save_summary(self.session_id, summary)
         # Render the human-readable management report next to summary.json.

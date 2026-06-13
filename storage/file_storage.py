@@ -93,3 +93,9 @@ class FileStorageBackend(StorageBackend):
         if not path.exists():
             return None
         return MeetingSummary(**read_json(path))
+
+    async def load_captions(self, session_id: str) -> list[CaptionEntry]:
+        path = self._dir(session_id) / "captions.json"
+        if not path.exists():
+            return []
+        return [CaptionEntry(**c) for c in read_json(path)]

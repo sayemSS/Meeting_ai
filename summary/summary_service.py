@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 
 from llm.deepseek_service import DeepSeekError, DeepSeekService
+from utils.language import language_rule_for
 from utils.logger import session_logger
 from utils.models import ActionItem, MeetingSummary, Transcript
 
@@ -50,19 +51,12 @@ _REPORT_RULES = """LENGTH RULES (the report is read by busy executives):
 
 LANGUAGE RULE: {language_rule} Keep the JSON keys in English."""
 
-# Per-language report instructions, chosen by the meeting's language setting.
-_LANGUAGE_RULES = {
-    "bn": "Write all values in Bengali (Bangla).",
-    "en": "Write all values in English.",
-    "mixed": (
-        "Write all values in Bengali (Bangla), but keep English technical "
-        "and business terms exactly as spoken (e.g. 'sales', 'budget', 'KPI')."
-    ),
-}
-_DEFAULT_LANGUAGE_RULE = (
-    "Write all values in the SAME LANGUAGE as the transcript "
-    "(Bengali transcript -> Bengali report)."
-)
+# NOTE: Report language is no longer hardcoded here. The effective language is
+# resolved upstream (sessions.session / tools.retranscribe) from the language
+# Whisper detected, and turned into the {language_rule} above by
+# utils.language.language_rule_for(). This is what guarantees the report is
+# written in the SAME language as the meeting (English meeting -> English
+# report), instead of always defaulting to Bangla.
 
 _FINAL_TEMPLATE = """Produce a management meeting report from the following transcript.
 
@@ -141,9 +135,13 @@ class SummaryService:
         self.session_id = session_id
         self.log = session_logger(__name__, session_id)
         self._llm = DeepSeekService()
-        lang = (language or "").strip().lower()
+        # `language` is the already-resolved report language: an ISO code such
+        # as "en"/"bn", "mixed", or "auto". The instruction is built from it so
+        # the output language always follows the meeting — nothing is forced to
+        # Bangla.
+        self._language = (language or "auto").strip().lower()
         self._rules = _REPORT_RULES.format(
-            language_rule=_LANGUAGE_RULES.get(lang, _DEFAULT_LANGUAGE_RULE)
+            language_rule=language_rule_for(self._language)
         )
 
     async def summarize(self, transcript: Transcript) -> MeetingSummary:

@@ -95,6 +95,9 @@ class MeetingMetadata(BaseModel):
     session_id: str
     title: str
     meet_url: str
+    # Language Whisper detected for the meeting audio (ISO 639-1 code, e.g.
+    # "en"/"bn"), or None if detection was unavailable. Drives report language.
+    language: Optional[str] = None
     scheduled_start: Optional[datetime] = None
     actual_start: Optional[datetime] = None
     actual_end: Optional[datetime] = None

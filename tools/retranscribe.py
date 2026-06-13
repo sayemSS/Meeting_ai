@@ -22,6 +22,7 @@ from config import get_settings
 from storage.file_storage import FileStorageBackend
 from summary.summary_service import SummaryService
 from transcriber.whisper_service import WhisperService
+from utils.language import resolve_report_language
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -56,8 +57,16 @@ async def main() -> None:
     preview = transcript.full_text[:300]
     log.info("Preview: %s%s", preview, "..." if len(transcript.full_text) > 300 else "")
 
+    # Persist the detected language and resolve the report language the same
+    # way the live pipeline does (explicit CLI choice wins, else detection).
+    metadata.language = transcript.language
+    await storage.save_metadata(session_id, metadata)
+    report_language = resolve_report_language(language, transcript.language)
+    log.info("Report language resolved to '%s' (requested=%s, detected=%s)",
+             report_language, language or "auto", transcript.language)
+
     log.info("Re-generating summary...")
-    summary = await SummaryService(session_id, language=language).summarize(transcript)
+    summary = await SummaryService(session_id, language=report_language).summarize(transcript)
     await storage.save_summary(session_id, summary)
 
     # report.md (if the builder exists in this project)
