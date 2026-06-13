@@ -7,3 +7,4 @@ auth/storage_state.json
 meetings/meeting_*/
 *.wav
 env
+mrrtings/
